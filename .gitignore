@@ -1,0 +1,21 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+.venv/
+env/
+
+# Data directories (keep directory structure, ignore content)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Serialized models and weights
+models/*
+!models/.gitkeep
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Environment / keys
+.env

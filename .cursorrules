@@ -1,0 +1,30 @@
+# Project: SSDI Claim Outcome Prediction Research Pipeline
+
+## Project Goal
+Build an interpretable machine learning pipeline to predict initial Social Security Disability Insurance (SSDI) claim outcomes (Approved vs. Denied) using pre-adjudication applicant features (demographics, vocational history, reported functional limitations).
+
+## Tech Stack
+- Language: Python 3.11+
+- Data Wrangling: Polars / Pandas / PyArrow (Parquet storage)
+- Models: LightGBM, XGBoost, Scikit-learn
+- Interpretability: SHAP
+- Code Style: Strict type hinting, modular pipelines in `src/`, runnable via CLI.
+
+## Domain Constraints & Anti-Leakage Guardrails (CRITICAL)
+1. **Target Leakage Prohibition:** Under NO circumstances include post-determination variables in feature matrices. This includes:
+   - Benefit payout amounts, payment dates, or direct deposit flags.
+   - Medicare/Medicaid entitlement flags.
+   - Post-claim income replacement or longitudinal welfare receipt.
+2. **Pre-Adjudication Features Only:** Features must strictly proxy what is known on **Form SSA-3368-BK (Disability Report - Adult)**:
+   - Age, education level, vocational background (SVP/exertional levels).
+   - Functional limitations (sitting, standing, lifting under 10 lbs / 10-25 lbs, walking limits).
+   - Impairment categories and self-reported health limits.
+3. **Evaluation Philosophy:**
+   - Raw accuracy is misleading due to class imbalance (~35% initial allowance rate).
+   - Optimize for **PR-AUC**, **ROC-AUC**, and **Brier Score (probability calibration)**.
+   - Always run a deterministic Medical-Vocational "Grid Rules" baseline before evaluating tree models.
+
+## Code Conventions
+- Store raw uncompressed data in `data/raw/` (never modify raw files in place).
+- Store intermediate/cleaned matrices in `data/processed/` using `.parquet`.
+- Never invent/hallucinate survey variable codes. When mapping columns, verify against official codebooks or flag uncertainties as `TODO: verify variable crosswalk`.
