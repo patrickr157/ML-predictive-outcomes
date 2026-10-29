@@ -1,4 +1,4 @@
-"""Derive SSA grid age groups and exertional features for SSDI applicants.
+"""Derive adjudication age, exertional capacity, and diagnostic group for SSDI applicants.
 
 ``pu2014ssa.dta`` has no application year. ``TONSET_AGE`` and ``TLIMWRKAGE`` are
 ages when the main condition or work limitation began. They are used as an
@@ -22,7 +22,66 @@ OUTPUT_PATH = PROJECT_ROOT / "data" / "processed" / "ssdi_features.parquet"
 
 MIN_GRID_AGE = 18
 MAX_GRID_AGE = 66
+# Ages 60 and older are capped at 59. In this survey that band mixes SSDI
+# outcomes with Old-Age and Survivors Insurance early-retirement substitution
+# and Full Retirement Age conversions, which otherwise pull age toward denial.
+AGE_CAP = 59
 EXERTIONAL_TIERS = ("sedentary_only", "light_max", "medium_or_above")
+
+# Census codes from TMAINCONDW / TMAIN in 2014SSA_Metadata_AllSections.pdf.
+# ``unreported`` is the reference level and is not one-hot encoded downstream.
+DIAGNOSIS_CODE_TO_GROUP: dict[str, str] = {
+    "03": "musculoskeletal",
+    "04": "musculoskeletal",
+    "06": "musculoskeletal",
+    "14": "musculoskeletal",
+    "21": "musculoskeletal",
+    "25": "musculoskeletal",
+    "40": "musculoskeletal",
+    "13": "circulatory",
+    "15": "circulatory",
+    "27": "circulatory",
+    "34": "circulatory",
+    "01": "mental",
+    "17": "mental",
+    "19": "mental",
+    "20": "mental",
+    "23": "mental",
+    "31": "mental",
+    "08": "neurological",
+    "11": "neurological",
+    "12": "neurological",
+    "33": "neurological",
+    "36": "neurological",
+    "18": "respiratory",
+    "10": "endocrine",
+    "28": "endocrine",
+    "38": "endocrine",
+    "05": "sensory",
+    "07": "cancer",
+    "29": "cancer",
+    "02": "other",
+    "16": "other",
+    "26": "other",
+    "30": "other",
+    "32": "other",
+    "35": "other",
+    "37": "other",
+    "39": "other",
+    "41": "none",
+}
+DIAGNOSIS_LEVELS = (
+    "musculoskeletal",
+    "circulatory",
+    "mental",
+    "neurological",
+    "respiratory",
+    "endocrine",
+    "sensory",
+    "cancer",
+    "other",
+    "none",
+)
 
 
 def load_claims(path: Path) -> pd.DataFrame:
@@ -40,7 +99,7 @@ def load_aligned_timing(claims: pd.DataFrame, raw_path: Path) -> pd.DataFrame:
     """
     timing = pd.read_stata(
         raw_path,
-        columns=["eapplyss", "tage_s", "tonset_age", "tlimwrkage"],
+        columns=["eapplyss", "tage_s", "tonset_age", "tlimwrkage", "tmaincondw", "tmain"],
         convert_categoricals=False,
     )
     timing.columns = [column.lower() for column in timing.columns]
@@ -58,6 +117,8 @@ def load_aligned_timing(claims: pd.DataFrame, raw_path: Path) -> pd.DataFrame:
     attached = claims.copy()
     attached["tonset_age"] = pd.to_numeric(applicants["tonset_age"], errors="raise")
     attached["tlimwrkage"] = pd.to_numeric(applicants["tlimwrkage"], errors="raise")
+    attached["tmaincondw"] = applicants["tmaincondw"].to_numpy()
+    attached["tmain"] = applicants["tmain"].to_numpy()
     return attached
 
 
@@ -79,22 +140,39 @@ def derive_adjudication_age(claims: pd.DataFrame) -> pd.DataFrame:
     source = source.mask(onset_ok, "tonset_age")
 
     claims = claims.copy()
-    claims["adjudication_age"] = age.round().astype("int64")
+    claims["adjudication_age"] = age.round().astype("int64").clip(upper=AGE_CAP)
     claims["adjudication_age_source"] = source
     return claims
 
 
-def add_age_bins(claims: pd.DataFrame) -> pd.DataFrame:
-    age = claims["adjudication_age"]
-    claims = claims.copy()
-    claims["age_under_50"] = age.lt(50).astype("int8")
-    claims["age_50_54"] = age.between(50, 54).astype("int8")
-    claims["age_55_59"] = age.between(55, 59).astype("int8")
-    claims["age_60_plus"] = age.ge(60).astype("int8")
-    covered = claims[["age_under_50", "age_50_54", "age_55_59", "age_60_plus"]].sum(axis=1)
-    if not covered.eq(1).all():
-        raise AssertionError("Age bins must be mutually exclusive and complete")
-    return claims
+def _condition_code(value: object) -> str | None:
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if text == "" or text.lower() in {"nan", "none"}:
+        return None
+    if text.endswith(".0"):
+        text = text[:-2]
+    if not text.isdigit():
+        return None
+    return text.zfill(2)
+
+
+def assign_diagnosis_group(claims: pd.DataFrame) -> pd.Series:
+    """Use the main work-limitation condition, then the main activity condition.
+
+    ``TMAINCONDW`` is the condition the person names as the main reason for a work
+    limitation. When that item is blank, ``TMAIN`` supplies the main condition
+    behind activity limits or fair/poor health.
+    """
+    work_code = claims["tmaincondw"].map(_condition_code)
+    activity_code = claims["tmain"].map(_condition_code)
+    chosen = work_code.where(work_code.notna(), activity_code)
+    group = chosen.map(DIAGNOSIS_CODE_TO_GROUP).fillna("unreported")
+    unknown = sorted(set(group.unique()) - set(DIAGNOSIS_LEVELS) - {"unreported"})
+    if unknown:
+        raise AssertionError(f"Unmapped diagnosis groups: {unknown}")
+    return group
 
 
 def assign_exertional_tier(claims: pd.DataFrame) -> pd.Series:
@@ -134,10 +212,11 @@ def add_functional_features(claims: pd.DataFrame) -> pd.DataFrame:
 
 def build_feature_matrix(claims: pd.DataFrame) -> pd.DataFrame:
     timed = derive_adjudication_age(claims)
-    binned = add_age_bins(timed)
-    featured = add_functional_features(binned)
-    # Onset ages are inputs to the proxy, not model features.
-    featured = featured.drop(columns=["tonset_age", "tlimwrkage"])
+    featured = add_functional_features(timed)
+    featured["diagnosis_group"] = assign_diagnosis_group(featured)
+    # Onset ages and raw condition codes are inputs, not model features.
+    # Age stays continuous so it is not repeated as collinear one-hot bins.
+    featured = featured.drop(columns=["tonset_age", "tlimwrkage", "tmaincondw", "tmain"])
     assert_no_forbidden_columns(featured.columns)
     return featured
 
@@ -151,6 +230,9 @@ def report(features: pd.DataFrame) -> None:
     for name in EXERTIONAL_TIERS:
         print(f"  {name} {int(features['exertional_tier'].eq(name).sum())}")
     print(f"severe_ambulation_limit {int(features['severe_ambulation_limit'].sum())}")
+    print("diagnosis_group")
+    for name, count in features["diagnosis_group"].value_counts().items():
+        print(f"  {name} {int(count)}")
 
 
 def main() -> None:
